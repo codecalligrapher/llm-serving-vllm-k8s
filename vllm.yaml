@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-svc
+spec:
+  replicas: 1                       # one GPU → one replica, non-negotiable here
+  selector:
+    matchLabels: {app: vllm}
+  template:
+    metadata:
+      labels: {app: vllm}
+    spec:
+      enableServiceLinks: false
+      containers:
+      - name: vllm
+        image: llm-serving:gpu
+        imagePullPolicy: Never       # use the imported image, don't pull
+        args: ["--model","Qwen/Qwen2.5-0.5B-Instruct", "--gpu-memory-utilization","0.35","--max-model-len","1024", "--enforce-eager"]
+        ports:
+        - {containerPort: 8000}
+        resources:
+          limits:
+            nvidia.com/gpu: 1        # the line that makes k8s assign the GPU
+        volumeMounts:
+        - {name: shm, mountPath: /dev/shm}
+        startupProbe:                # gates liveness while the model loads
+          httpGet: {path: /health, port: 8000}
+          periodSeconds: 10
+          failureThreshold: 30       # 30×10s = 5 min grace to become ready
+        livenessProbe:
+          httpGet: {path: /health, port: 8000}
+          periodSeconds: 10
+        readinessProbe:
+          httpGet: {path: /health, port: 8000}
+          periodSeconds: 5
+      volumes:
+      - name: shm
+        emptyDir: {medium: Memory, sizeLimit: 2Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm
+spec:
+  selector: {app: vllm}
+  ports:
+  - {port: 8000, targetPort: 8000, name: http}

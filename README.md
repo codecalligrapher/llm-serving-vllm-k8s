@@ -1,5 +1,10 @@
 # llm-serving-vllm-k8s
 
+## Links to the blog-posts:
+[1. Building a multi-stage Docker image for locally serving an LLM](https://aadi-blogs.web.app/blog/docker-llm/)  
+[2. Spinning up a simple k3s to manage a local LLM Docker Container](https://aadi-blogs.web.app/blog/intro-to-k3s/)
+
+
 Serving a small, open-source LLM behind `vLLM`, containerized on a single desktop GPU. 
 
 The target is to have a single-node Kubernetes, with Grafana to monitor and a throughput benchmark.

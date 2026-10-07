@@ -1,9 +1,10 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: vllm-svc
+  name: vllm
+  labels: {app: vllm}
 spec:
-  replicas: 1                       # one GPU → one replica, non-negotiable here
+  replicas: 1
   selector:
     matchLabels: {app: vllm}
   template:
@@ -14,19 +15,19 @@ spec:
       containers:
       - name: vllm
         image: llm-serving:gpu
-        imagePullPolicy: Never       # use the imported image, don't pull
-        args: ["--model","Qwen/Qwen2.5-0.5B-Instruct", "--gpu-memory-utilization","0.35","--max-model-len","1024", "--enforce-eager"]
+        imagePullPolicy: Never
+        args: ["--model","Qwen/Qwen2.5-0.5B-Instruct",
+               "--gpu-memory-utilization","0.35","--max-model-len","1024","--enforce-eager"]
         ports:
         - {containerPort: 8000}
         resources:
-          limits:
-            nvidia.com/gpu: 1        # the line that makes k8s assign the GPU
+          limits: {nvidia.com/gpu: 1}
         volumeMounts:
         - {name: shm, mountPath: /dev/shm}
-        startupProbe:                # gates liveness while the model loads
+        startupProbe:
           httpGet: {path: /health, port: 8000}
           periodSeconds: 10
-          failureThreshold: 30       # 30×10s = 5 min grace to become ready
+          failureThreshold: 30
         livenessProbe:
           httpGet: {path: /health, port: 8000}
           periodSeconds: 10
@@ -40,8 +41,27 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: vllm
+  name: vllm-svc
+  labels: {app: vllm}
 spec:
   selector: {app: vllm}
   ports:
   - {port: 8000, targetPort: 8000, name: http}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: vllm
+  namespace: monitoring
+  labels:
+    release: kps
+spec:
+  selector:
+    matchLabels:
+      app: vllm
+  namespaceSelector:
+    matchNames: ["default"]
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 5s

@@ -1,155 +1,140 @@
 # llm-serving-vllm-k8s
 
-## Links to the blog-posts:
-[1. Building a multi-stage Docker image for locally serving an LLM](https://aadi-blogs.web.app/blog/docker-llm/)  
-[2. Spinning up a simple k3s to manage a local LLM Docker Container](https://aadi-blogs.web.app/blog/intro-to-k3s/)
+Serving a small open LLM behind vLLM on a single-node k3s cluster, with Prometheus and Grafana for observability. Built on an 8GB desktop GPU to learn the serving and ops layer end to end, not as a production system.
+
+**Status:** serving and monitoring are built and working. The load benchmark is scoped but not yet run (see Roadmap).
+
+## Links to Blog Posts:
+[1. Building a multi-stage Docker image for locally serving an LLM]()  
+[2. Spinning up a simple k3s to manage a local LLM Docker Container](https://aadi-blogs.web.app/blog/intro-to-k3s/)  
+[3. Spinning up a simple k3s to manage a local LLM Docker Container](https://aadi-blogs.web.app/blog/basic-k3s-monitoring/)
+
+## What this is
+
+A data scientist's walk into the ML-engineering half of the job: take a model, containerize it, schedule it on a GPU under Kubernetes, put a stable endpoint in front of it, and wire up the metrics that tell you when it is about to fall over. The model itself (Qwen2.5-0.5B-Instruct) is deliberately small. The point is the pipeline and the measurement, not inference performance on a desktop card.
+
+## Architecture
 
 
-Serving a small, open-source LLM behind `vLLM`, containerized on a single desktop GPU. 
+```mermaid
+flowchart LR
+    client["curl / client"]
 
-The target is to have a single-node Kubernetes, with Grafana to monitor and a throughput benchmark.
+    subgraph k3s["k3s single-node cluster"]
+        subgraph ns_default["namespace: default"]
+            svc["Service: vllm-svc<br/>stable ClusterIP, port 8000"]
+            pod["Pod: vLLM container<br/>GPU limit 1<br/>/v1 + /metrics on :8000"]
+            sm["ServiceMonitor: vllm"]
+        end
+        subgraph ns_monitoring["namespace: monitoring"]
+            prom["Prometheus<br/>scrapes /metrics"]
+            graf["Grafana<br/>TTFT, ITL, throughput, KV-cache"]
+        end
+    end
 
-> Status: containerized OpenAI-compatible endpoint running on an RTX 3060 Ti (8GB). K8s, monitoring, and benchmark are scoped below but not yet built.
-
-## Why vLLM
-Mainly because of the OpenAI-compatible server, so the endpoint is `v1/chat/completions` and any OpenAI client works against it.
-
-However, there are two additional advantages:
-1. Instead of using `transformers` in Python `vLLM` delivers [PagedAttention](https://www.runpod.io/articles/guides/vllm-pagedattention-continuous-batching) for sovling memory fragmentation and contiguous allocation. It's similar to virtual memory in OS memory-paging which reduces over-reservation that contiguous per-sequence allocation causes.
-2. We get continuous batching, which prevents GPU idling. When the GPU gets a set of requests, it statically batches all until they're ready to be operated on, runs them in parallel then forms the next batch. However, sequences finish at varying different lengths of times, which means that most of the GPU may sit idling waiting for one element in a batch to complete its computation. The continuous batching pardigm batches at the iteration level, not the request level which allows the GPU to be more continually saturated. 
-
-
-
-## Entry point: vllm serve
-
-Launch with vllm serve MODEL, not `python -m vllm.entrypoints.openai.api_server --model MODEL`. The latter is deprecated in current vLLM (emits a DeprecationWarning, slated for removal)
-
-## The container: what "match the node driver" actually means
-
-The central fact that drove every base-image decision: the container never contains the GPU driver. It carries CUDA userspace libraries; the driver (libcuda.so) is injected from the host at runtime by the NVIDIA Container Toolkit (--gpus all, or the K8s device plugin). So "match the driver" doesn't mean equal versions — it means the container's CUDA toolkit must be ≤ the maximum CUDA the host driver supports. Newer drivers run older toolkits; the reverse fails.
-
-On this box, nvidia-smi reports driver 595.80 / CUDA 13.2 ceiling, so any CUDA ≤ 13.2 in the container is safe. The RTX 3060 Ti is Ampere, sm_86.
-
-A subtlety that makes the base image's CUDA tag nearly cosmetic for a pip-installed stack: the PyPI torch wheel bundles its own CUDA userspace (nvidia-cublas-cu12, nvidia-cudnn-cu12, nvidia-nccl-cu12…) as pip packages, and its `.sos` carry RUNPATH entries pointing at those bundled libs. So cuBLAS-from-the-image is shadowed by cuBLAS-from-pip. The container carries CUDA userspace via pip; the host injects kernel-space via the driver. The base image's CUDA version is almost a red herring, the pip-bundled CUDA version is the thing actually under the driver-compatibility constraint.
-
-
-# Failures
-There was definitely some experimentation around how I got here regarding the `Dockerfile` so I thought to document certain design decision
-
-## Failure 1 - a release-candidate Python
-
-First hand-rolled multi-stage build (CUDA -runtime base, apt install python3.11, venv, pip install vllm) crashed on import:
-```
-AttributeError: module 'sys' has no attribute 'get_int_max_str_digits'
+    client -->|port-forward| svc
+    svc -->|routes to| pod
+    sm -.->|tells Prometheus what to scrape| prom
+    prom -->|GET /metrics via Service| pod
+    graf -->|PromQL| prom
 ```
 
-`sys.get_int_max_str_digits` shipped in every stock CPython ≥ `3.11.0`. Its absence meant the interpreter wasn't a released 3.11.x. It was 3.11.0rc1, a from-source release candidate pulled in by forcing python3.11 onto an Ubuntu base whose native Python is a different version.
 
-**Fix**: never hand-pick a Python minor the base distro doesn't own. Use the base's native python3 (a real released build from the distro archive), and pin the base image so it can't drift. If a newer vLLM needs a newer Python, move the base to one whose native python3 satisfies it (e.g. an ubuntu24.04 CUDA tag → 3.12) and don't install a foreign interpreter.
+A Deployment owns the Pod and keeps one replica alive. The Service gives it a fixed address in front of the Pod's changing IP. The ServiceMonitor is config, not a data path: it tells the already-running Prometheus to scrape the Service's `/metrics`. Grafana queries Prometheus and never touches vLLM directly.
 
-## Failure 2 - a dangling interpreter symlink
-```/opt/venv/bin/python3: bad interpreter: No such file or directory```
+## Stack
 
-A venv is not self-contained: `/opt/venv/bin/python3` is a symlink to the interpreter that built the venv. The multi-stage `COPY --from=builder /opt/venv` carried the symlink into a runtime stage that never installed python3, so the target didn't exist and the shebang couldn't resolve.
+- **Model serving:** vLLM (OpenAI-compatible server, native Prometheus metrics)
+- **Container base:** `vllm/vllm-openai:v0.28.0`
+- **Orchestration:** k3s (single node), NVIDIA device plugin, nvidia default runtime
+- **Monitoring:** kube-prometheus-stack (Prometheus + Grafana + operator) via Helm
+- **Hardware:** RTX 3060 Ti (8GB, Ampere sm_86), driver 595.80
 
-**Fix (and the rule)***: the runtime stage must install the same python3 the venv points at, and both stages must use the identical pinned base so the interpreter lives at the same path with a matching glibc/libpython ABI.
+## Quickstart
 
-## Failure 3 - Hardware reality: 8GB, shared with the desktop
-
-`nvidia-smi` shows 7.66 GiB usable (not a clean 8), with the desktop (gnome-shell, Xwayland, apps) already holding ~1.3GB. That leaves ~6GB for serving.
-
-### Model memory math (fp16 = 2 bytes/param):
-
-3B fp16 ≈ 6.2GB weights — leaves nothing for KV cache. OOM.
-1.5B fp16 ≈ 3GB.
-0.5B fp16 ≈ 1GB.
-
-The path here is to shrink the model until it fits the actual free budget rather than fight the display for memory. Running the box headless (integrated graphics, or stopping the display manager) reclaims the ~1.3GB and is more effective than any single flag.
-
-### Quantization and the kernel-compilation rabbit hole
-
-To fit 3B I first went 4-bit AWQ (~2GB weights), which pulled in a chain of runtime-compilation failures that turned out to be the most instructive part of the project:
-
-- `Failed to find C compiler`: Triton JIT-compiles a C launcher stub and the -runtime base has no gcc. 
-- `/usr/local/cuda/bin/nvcc not found`: a CUDA source compile needs the full toolkit, which lives only in -devel. The logs named the real culprit: FlashInfer. vLLM uses it as the attention/sampling backend, and it JIT-compiles its CUDA kernels from .cu source at first use, cross-compiled for sm_86, via nvcc:
-```
-flashinfer/jit/cpp_ext.py → run_ninja → nvcc ... flashinfer_sampling_binding.cu
-/bin/sh: 1: /usr/local/cuda/bin/nvcc: not found   [code=127]
-```
-
-The lesson: three separate subsystems (Triton, torch.compile, FlashInfer) compile at runtime, and a CUDA -runtime base can satisfy none of them. Adding tools one at a time just exposes the next missing one, the endpoint is essentially rebuilding -devel by hand.
-
-**Decision**: base on the official `vllm/vllm-openai` image, which ships a matched CUDA/torch/vLLM/FlashInfer toolchain so these compiles succeed rather than being suppressed. This trades a large image for correctness and reproducibility, where working compiled kernels are the headline and image size is a footnote.
-
-## Memory tuning — utilization is a reservation, not a cap
-
-Even at 1.5B, OOM:
-
-- GPU 0 has total capacity of 7.66 GiB of which 201.69 MiB is free.
-- this process has 5.73 GiB memory in use.
-
-- 3GB of weights, but the process held 5.73GB, `--gpu-memory-utilization` is a target reservation: vLLM computes (utilization × total) and pre-reserves that whole block for weights + KV cache, then CUDA-graph capture asks for more on top. 0.70 × 7.66 ≈ 5.4GB collided with the shared budget
-
-### Levers, in order of impact:
-
-`--gpu-memory-utilization` 0.55: lower the reservation to fit under what's actually free (desktop is holding ~1.3GB). Lowering, not raising, is the fix.
-`--enforce-eager`: disables CUDA-graph capture, removing the private-pool allocations and the capture-time spike that issued the failing request. Costs some throughput; a deliberate memory-vs-throughput trade on an 8GB shared card.
-`--max-model-len 1024`: KV-cache reservation scales with context length; capping it frees cache memory.
-
-# Multi-stage, reconsidered
-
-Multi-stage separates build-time bulk from runtime; it cannot shrink runtime bulk. On the official image the bulk (torch + CUDA userspace + vLLM + FlashInfer) is all required at runtime, and FlashInfer compiles at runtime which meant that a stripped runtime base fails exactly as above. Copying the env onto a slim base would mean re-adding the toolchain (back to -devel) plus risking ABI mismatch: not slimming, just reconstructing the official image badly.
-## Building
-Where same-base multi-stage does earn its place: baking a genuinely separable artifact to move a runtime cost to build time. The builder downloads the weights; the runtime stage copies them in, converting "pull weights on every cold start" into "already in the image."
-
-```dockerfile
-FROM vllm/vllm-openai:v0.28.0 AS fetch
-RUN python3 -c "from huggingface_hub import snapshot_download; \
-    snapshot_download('Qwen/Qwen2.5-1.5B-Instruct')"
-
-FROM vllm/vllm-openai:v0.28.0
-COPY --from=fetch /root/.cache/huggingface /root/.cache/huggingface
-CMD ["--model","Qwen/Qwen2.5-1.5B-Instruct",\
-     "--gpu-memory-utilization","0.55","--max-model-len","2048","--enforce-eager"]
-```
-
-The image's ENTRYPOINT is already vllm serve, so CMD supplies args only. The tradeoff is a larger, immutable, air-gap-ready image with instant cold start, versus a small image that pulls at runtime. 
-
-## Running it: 
+Build and import the image into k3s's containerd (k3s cannot see Docker's image store):
 
 ```bash
 docker build -t llm-serving:gpu .
-docker run --rm --gpus all -p 8000:8000 --ipc=host llm-serving:gpu
+docker save llm-serving:gpu -o /tmp/llm.tar
+sudo k3s ctr -n k8s.io images import /tmp/llm.tar
 ```
 
-Wait for Uvicorn running on http://0.0.0.0:8000 before querying.
-
-## Querying
+Deploy serving and confirm the Pod is ready:
 
 ```bash
+kubectl apply -f k8s/vllm.yaml
+kubectl get pods -w            # wait for READY 1/1
+```
+
+Reach the endpoint from the host:
+
+```bash
+kubectl port-forward svc/vllm-svc 8000:8000
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"Qwen/Qwen2.5-1.5B-Instruct","messages":[{"role":"user","content":"Say hello in one word."}]}'
+  -d '{"model":"Qwen/Qwen2.5-0.5B-Instruct","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-or in Python:
+Deploy monitoring:
 
-```python
-import requests
-r = requests.post("http://localhost:8000/v1/chat/completions",
-    json={"model":"Qwen/Qwen2.5-1.5B-Instruct",
-          "messages":[{"role":"user","content":"Say hello in one word."}]})
-r.raise_for_status()
-print(r.json()["choices"][0]["message"]["content"])
+```bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+helm install kps prometheus-community/kube-prometheus-stack -n monitoring --create-namespace
+kubectl apply -f k8s/servicemonitor.yaml
 ```
 
-# What I'd do next (roadmap)
-- Single-node Kubernetes (k3s/kind): Deployment with a nvidia.com/gpu resource request, readiness/liveness probes on vLLM's /health, a Service. Note: K8s ignores a container's Docker HEALTHCHECK and uses its own probes.
-- Weight persistence in K8s: PVC or emptyDir mounted at the HF cache so pod reschedules don't re-download — same problem the weight-baking solves at image level, different mechanism.
-- Monitoring: vLLM exports Prometheus metrics natively (TTFT, inter-token latency, throughput, KV-cache utilization, queue depth). Grafana dashboard on those.
-- Benchmark: sweep concurrency 1→50, plot throughput vs. latency; the knee where the KV cache saturates and requests queue is the headline result. Discard the first request (JIT/compile warmup) so cold-start cost doesn't pollute latency numbers.
-- Production hardening: run as non-root (runAsNonRoot), a tini/--init shim for PID-1 zombie reaping of vLLM's worker subprocesses, autoscaling on queue depth, multi-replica.
+Grafana (dashboard JSON in `grafana/`):
 
-### Environment
+```bash
+kubectl -n monitoring port-forward svc/kps-grafana 3000:80
+kubectl -n monitoring get secret kps-grafana -o jsonpath='{.data.admin-password}' | base64 -d; echo
+```
 
-RTX 3060 Ti (8GB, Ampere sm_86), driver 595.80 (CUDA 13.2 ceiling), vllm/vllm-openai:v0.28.0. Benchmarks, when added, will be taken headless to avoid contention with the desktop sharing the GPU.
+## Design decisions
+
+**Why vLLM.** The serving layer had to do more than load a model and call generate. vLLM was chosen for two mechanisms that define its throughput: paged attention, which manages the KV cache as fixed-size blocks with a per-sequence block table instead of one contiguous allocation, eliminating the fragmentation that wastes GPU memory; and continuous batching, which admits and evicts requests at the per-iteration level so the GPU stays saturated instead of stalling on the slowest request in a fixed batch. It also ships an OpenAI-compatible server and a native Prometheus `/metrics` endpoint, so the API surface and the observability surface both came for free. On an 8GB GPU shared with the display, those memory mechanics are not academic; they are what makes a model serve concurrent load at all.
+
+**Why multi-stage, and its limit.** The instinct was a multi-stage build to keep the image small, and that instinct was wrong for this stack. A CUDA runtime base has no build toolchain, but vLLM compiles at runtime in three places (Triton, torch.compile, and FlashInfer's nvcc kernel build), so a stripped runtime image fails at first inference. The bulk being shipped (torch, CUDA userspace, vLLM, FlashInfer) is all required at runtime and cannot be left behind, so multi-stage cannot shrink it. What multi-stage is actually good for here is moving a runtime cost to build time: a builder stage downloads the model weights into the image so the container does not pull them from Hugging Face on every cold start. Same base image in both stages, because the goal is baking an artifact, not slimming. The honest trade is a larger, immutable image in exchange for fast, reproducible, offline-capable startup.
+
+**Why these probes.** vLLM takes minutes to load weights and warm up, which breaks the naive single-liveness-probe setup: liveness starts checking immediately, fails while the model is still loading, and Kubernetes kills the container mid-boot into a crash loop. The fix is three probes doing three distinct jobs. A startupProbe with a generous failure budget gates the others, giving the model time to come up without being killed. The livenessProbe takes over only after startup passes and restarts the container if it later wedges. The readinessProbe controls traffic independently: a failing readiness check pulls the Pod out of the Service's endpoints without restarting it, so requests only route to a Pod that can answer. All three hit `/health`, but they act on the result differently, and conflating them is what produces the crash loop.
+
+**Why the Service is named `vllm-svc` and not `vllm`.** Kubernetes injects service-discovery env vars derived from the Service name. A Service named `vllm` sets `VLLM_PORT` to a URI like `tcp://10.43.x.x:8000`, which vLLM reads as its own bind-port config and the engine dies at init. Renaming the Service breaks the collision, and `enableServiceLinks: false` on the Pod disables the whole class of injected link vars as a second guard.
+
+**Why a `/dev/shm` memory volume.** vLLM's worker processes share tensors over `/dev/shm`. A Pod's default is 64MB, the same cap that bites under plain Docker, and the workers crash without more. An `emptyDir` with `medium: Memory` mounted at `/dev/shm` is the Kubernetes equivalent of `--ipc=host`.
+
+## Monitoring
+
+The ServiceMonitor carries one non-obvious requirement: a `release: kps` label. The kube-prometheus-stack Prometheus only adopts ServiceMonitors whose labels match its selector, defaulted to the Helm release name. Without that label the object is valid, created, and silently ignored, which is the most common "my target is missing" cause.
+
+The dashboard tracks four metrics. The names are for vLLM's V1 engine; verify against your own `/metrics` since they shift between releases.
+
+| Metric | vLLM metric | Query note |
+|---|---|---|
+| TTFT (p95) | `vllm:time_to_first_token_seconds` | histogram, `histogram_quantile` over `_bucket` |
+| Inter-token latency (p95) | `vllm:inter_token_latency_seconds` | histogram, same pattern |
+| Throughput (tokens/s) | `vllm:generation_tokens_total` | counter, needs `rate()` |
+| KV-cache utilization | `vllm:kv_cache_usage_perc` | gauge, graph as-is |
+
+The counter-versus-gauge distinction matters: a `_total` counter only climbs and is meaningless without `rate()`; a gauge is already an instantaneous level and must not be wrapped in `rate()`. Getting this wrong is what produces empty or nonsensical panels.
+
+The panel worth keeping if you could keep only one is KV-cache utilization plotted against `vllm:num_requests_waiting`. As the cache fills toward 1.0 under load, new sequences cannot be admitted and start queuing, so waiting requests lift off zero at the same moment. That correlation is paged attention made visible, and it shows saturation before latency has fully blown up.
+
+## Roadmap
+
+- **Load benchmark:** sweep concurrency 1 to 50, record p95 latency and achieved throughput per level, plot latency versus throughput, and mark the knee where the KV cache saturates. Discard a warmup request so cold-start compilation does not pollute the latency numbers.
+- **Weight persistence under restart:** PVC or hostPath at the HF cache so Pod reschedules do not re-download.
+- **Production hardening:** run as non-root, a tini or `--init` shim for PID-1 zombie reaping of vLLM worker subprocesses, autoscaling on queue depth, multi-replica with a registry instead of local image import.
+
+## Notes and gotchas
+
+A few things that cost real time, kept here because they are the parts the docs skip:
+
+- The locally built image is invisible to k3s until imported into containerd's `k8s.io` namespace, otherwise the Pod sits in `ErrImageNeverPull`.
+- On Fedora, firewalld blocks the Flannel pod network by default, so every pod-to-pod scrape fails with "no route to host" until the pod and service CIDRs and the VXLAN port are allowed.
+- Benchmarks will be run headless to avoid contention with the desktop sharing the GPU; measurements taken on a shared display GPU are noted as such rather than reported as clean.
+
+## Environment
+
+RTX 3060 Ti (8GB, Ampere sm_86), driver 595.80 (CUDA 13.2 ceiling), k3s v1.36, `vllm/vllm-openai:v0.28.0`, kube-prometheus-stack via Helm.

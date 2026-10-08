@@ -10,11 +10,14 @@ Serving a small open LLM behind vLLM on a single-node k3s cluster, with Promethe
 [3. Spinning up a simple k3s to manage a local LLM Docker Container](https://aadi-blogs.web.app/blog/basic-k3s-monitoring/)
 
 ## What this is
-
 A data scientist's walk into the ML-engineering half of the job: take a model, containerize it, schedule it on a GPU under Kubernetes, put a stable endpoint in front of it, and wire up the metrics that tell you when it is about to fall over. The model itself (Qwen2.5-0.5B-Instruct) is deliberately small. The point is the pipeline and the measurement, not inference performance on a desktop card.
 
-## Architecture
+# Dashboard Demos
+> These are included with full tutorials in the blog posts, but included here for demonstration
 
+![Dashboard](https://aadi-blogs.web.app/images/basic-k3s-monitoring/final.png)
+
+## Architecture
 
 ```mermaid
 flowchart LR
